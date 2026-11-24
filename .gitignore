@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Dependencies (tests only; the extension itself has none)
+node_modules/
+
+# Captures made while testing. Screenshots can contain private information:
+# never commit a real capture. Samples in this repository must come from the
+# made-up pages under test/.
+/captures/
+/test-results/
+/tmp/
+
+# Packaged builds and the private key Chrome generates when packing
+/dist/
+*.zip
+*.crx
+*.pem
+
+# Local-only notes and settings
+*.local
+*.local.*
+.env
+.env.*
