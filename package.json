@@ -1,0 +1,16 @@
+{
+  "name": "clip",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome extension that captures the entire page in one shot and copies it to the clipboard.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 'test/*.test.mjs'",
+    "test:retina": "CLIP_TEST_DEVICE_SCALE=2 node --test --test-concurrency=1 'test/*.test.mjs'",
+    "test:standard": "CLIP_TEST_DEVICE_SCALE=1 node --test --test-concurrency=1 'test/*.test.mjs'"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1"
+  }
+}
