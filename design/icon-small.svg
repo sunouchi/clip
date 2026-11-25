@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <!-- The same mark for 16 px: on the pixel grid, without the lines of text. -->
+  <rect width="16" height="16" rx="3.5" fill="#f0532d"/>
+  <rect x="6" y="3" width="4" height="10" rx=".5" fill="#fff"/>
+  <g fill="#fff">
+    <path d="M2 2h2.5v1.5h-1V5H2z"/>
+    <path d="M11.500 2H14v3h-1.500V3.500h-1z"/>
+    <path d="M14 11v3h-2.500v-1.500h1V11z"/>
+    <path d="M2 11h1.500v1.500h1V14H2z"/>
+  </g>
+</svg>

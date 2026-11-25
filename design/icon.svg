@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- A tall page inside a viewfinder: the whole page, captured. -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#f0532d"/>
+  <rect x="46" y="26" width="36" height="76" rx="5" fill="#fff"/>
+  <g fill="#f0532d">
+    <rect x="53" y="36" width="22" height="8" rx="2"/>
+    <rect x="53" y="52" width="22" height="5" rx="2"/>
+    <rect x="53" y="63" width="22" height="5" rx="2"/>
+    <rect x="53" y="74" width="14" height="5" rx="2"/>
+  </g>
+  <g fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M24 44V30a6 6 0 0 1 6-6h4"/>
+    <path d="M94 24h4a6 6 0 0 1 6 6v14"/>
+    <path d="M104 84v14a6 6 0 0 1-6 6h-4"/>
+    <path d="M34 104h-4a6 6 0 0 1-6-6V84"/>
+  </g>
+</svg>
