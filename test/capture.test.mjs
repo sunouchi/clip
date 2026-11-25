@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 import {
   BAR_COLOR, CARD_COLOR, FOOTER_COLOR, HEADER_COLOR, REVEAL_COLOR, SECTION_COLORS, STICKY_COLOR,
-  growingPage, rulerPage, sectionsPage, trickyPage,
+  barsPage, growingPage, rulerPage, sectionsPage, trickyPage,
 } from './pages.mjs';
 
 const EXTENSION = fileURLToPath(new URL('../extension', import.meta.url));
@@ -31,6 +31,7 @@ const TOAST = '[data-clip-toast]';
 let context;
 let worker;
 let browserSession;
+let videoTrouble = []; // what the extension said when it went on without video
 let profileDir;
 
 before(async () => {
@@ -43,7 +44,7 @@ before(async () => {
       `--disable-extensions-except=${EXTENSION}`,
       `--load-extension=${EXTENSION}`,
       `--force-device-scale-factor=${DEVICE_SCALE}`,
-      '--window-size=1280,800',
+      '--window-size=1280,801', // 714 px tall inside: an even number, which video needs
       '--enable-unsafe-extension-debugging', // for Extensions.triggerAction
     ],
   });
@@ -51,7 +52,8 @@ before(async () => {
     const query = new URL(route.request().url()).searchParams;
     let body = sectionsPage(Number(query.get('sections') ?? 3));
     if (query.has('ruler')) body = rulerPage(Number(query.get('ruler')));
-    if (query.has('tricky')) body = trickyPage();
+    if (query.has('bars')) body = barsPage(Number(query.get('bars')));
+    if (query.has('tricky')) body = trickyPage(Number(query.get('footer') ?? 200));
     if (query.has('growing')) body = growingPage(Number(query.get('growing')));
     const headers = { 'content-type': 'text/html; charset=utf-8' };
     if (query.has('csp')) headers['content-security-policy'] = "default-src 'none'; style-src 'sha256-x'; require-trusted-types-for 'script'";
@@ -60,6 +62,9 @@ before(async () => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
   worker = context.serviceWorkers()[0] ?? (await context.waitForEvent('serviceworker'));
   browserSession = await context.browser().newBrowserCDPSession();
+  worker.on('console', (message) => {
+    if (message.text().includes('without video')) videoTrouble.push(message.text());
+  });
   // Note every outcome on its way to the user.
   await worker.evaluate(() => {
     const original = globalThis.report;
@@ -159,6 +164,11 @@ async function captureVisible() {
   return outcome();
 }
 
+/** How long captures may wait for Chrome's rate limit: Infinity for exact screens only, 0 for as few as possible. */
+function setExactMs(ms) {
+  return worker.evaluate((ms) => { limits.exactMs = ms; }, ms);
+}
+
 /** What the sections page looks like before the capture, measured in the page. */
 function measureSectionsPage(page) {
   return page.evaluate(() => ({
@@ -208,10 +218,19 @@ function inspectClipboardImage(page, expected) {
 }
 
 /** The places where a color shows up down the left edge of the image. */
-const placesOf = (image, color) => image.runs.filter((run) => run.color === color);
+function placesOf(image, color, tolerance = 0) {
+  return image.runs.filter((run) => difference(run.color, color) <= tolerance);
+}
+
+/** The largest difference between two colors, like '#102030', in any channel. */
+function difference(a, b) {
+  const channels = (color) => [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
+  const other = channels(b);
+  return Math.max(...channels(a).map((value, i) => Math.abs(value - other[i])));
+}
 
 /** Captures a sections page and asserts that the image shows the whole page, correctly. */
-async function assertSectionsPageCaptured(page, { readIn = page } = {}) {
+async function assertSectionsPageCaptured(page, { readIn = page, tolerance = 0 } = {}) {
   const expected = await measureSectionsPage(page);
   const result = await capture(page);
   assert.equal(result.ok, true, `capture failed: ${result.reason}`);
@@ -224,17 +243,89 @@ async function assertSectionsPageCaptured(page, { readIn = page } = {}) {
   assert.deepEqual(placesOf(image, HEADER_COLOR).map(({ top }) => top), [0], 'the fixed header appears once, at the top');
   assert.equal(image.topRightColor, HEADER_COLOR, 'the toast of an earlier capture is not in the image');
   assert.equal(image.bottomColor, FOOTER_COLOR, 'the image ends with the footer');
-  assert.deepEqual(
-    image.sectionColors,
-    expected.sectionCenters.map((_, i) => SECTION_COLORS[i % SECTION_COLORS.length]),
-    'every section is where it should be',
-  );
+  const wrong = expected.sectionCenters
+    .map((_, i) => ({ section: i, is: image.sectionColors[i], shouldBe: SECTION_COLORS[i % SECTION_COLORS.length] }))
+    .filter(({ is, shouldBe }) => difference(is, shouldBe) > tolerance);
+  assert.deepEqual(wrong, [], 'every section is where it should be');
   assert.equal(image.width, result.width);
   assert.equal(image.height, result.height);
   assert.ok(Math.abs(image.height / image.scale - expected.cssHeight) <= 1,
     `the image is as tall as the page (${image.height / image.scale} for ${expected.cssHeight})`);
   assert.equal(scrollY, expected.scrollY, 'the scroll position is restored');
   return { result, image };
+}
+
+/** Everything about the tricky page that a capture could have changed. */
+function trickyState(page) {
+  return page.evaluate((toast) => {
+    const copy = document.documentElement.cloneNode(true);
+    copy.querySelectorAll(toast).forEach((element) => element.remove());
+    copy.querySelector('.reveal').classList.remove('seen'); // scrolling past it is what sets this
+    return { html: copy.outerHTML, scrollY: Math.round(window.scrollY) };
+  }, TOAST);
+}
+
+function measureTrickyPage(page) {
+  return page.evaluate(() => {
+    const top = (selector) => Math.round(document.querySelector(selector).getBoundingClientRect().top + scrollY);
+    return { cssWidth: document.documentElement.clientWidth, cssHeight: document.documentElement.scrollHeight,
+      reveal: top('.reveal'), box: top('.box'), footer: top('footer') };
+  });
+}
+
+async function assertNothingLeftBehind(page) {
+  assert.equal(await page.locator('[data-clip-mark]').count(), 0, 'the mark is gone');
+  assert.equal(await worker.evaluate(() => chrome.offscreen.hasDocument()), false, 'the tab is no longer filmed');
+}
+
+/** Reads the bars page back from the clipboard, row by row. */
+function readBars(page) {
+  return page.evaluate(async () => {
+    const [item] = await navigator.clipboard.read();
+    const bitmap = await createImageBitmap(await item.getType('image/png'));
+    const { width, height } = bitmap;
+    const scale = width / document.documentElement.clientWidth;
+    const cell = width / 20;
+    // The middle of every bar, and more columns where the mark is drawn.
+    const columns = Array.from({ length: 20 }, (_, i) => Math.round((i + 0.5) * cell));
+    const extra = [];
+    for (let x = 30; x < 116; x += 4) {
+      const at = Math.round(x * scale);
+      const bar = Math.floor(at / cell);
+      if (bar < 2 && Math.abs(at - cell) > 4 && Math.abs(at - 2 * cell) > 4) extra.push([at, bar === 0 ? 255 : 0]);
+    }
+    const canvas = new OffscreenCanvas(width, height);
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(bitmap, 0, 0);
+    const unreadable = [];
+    const jumps = [];
+    let previous = -1, run = 0, shortest = Infinity, tallest = 0, first = null;
+    const STRIP = 2000;
+    for (let top = 0; top < height; top += STRIP) {
+      const rows = Math.min(STRIP, height - top);
+      const { data } = context.getImageData(0, top, width, rows);
+      for (let r = 0; r < rows; r++) {
+        const at = (x) => data[(r * width + x) * 4];
+        const bits = columns.map((x) => (at(x) > 240 ? 1 : at(x) < 15 ? 0 : NaN));
+        const ok = bits[0] === 1 && bits[1] === 0 && bits[18] === 0 && bits[19] === 1 && !bits.some(Number.isNaN)
+          && extra.every(([x, value]) => Math.abs(at(x) - value) < 15);
+        if (!ok) { if (unreadable.length < 5) unreadable.push(top + r); continue; }
+        const band = bits.slice(2, 18).reduce((sum, bit) => sum * 2 + bit, 0);
+        first ??= band;
+        if (band !== previous) {
+          if (previous >= 0) {
+            shortest = Math.min(shortest, run);
+            tallest = Math.max(tallest, run);
+            if (band !== previous + 1) jumps.push({ row: top + r, from: previous, to: band });
+          }
+          run = 0;
+        }
+        run++;
+        previous = band;
+      }
+    }
+    return { first, last: previous, unreadable, jumps: jumps.slice(0, 5), shortest, tallest };
+  });
 }
 
 /** Captures a ruler page and asserts that no row is missing, duplicated or out of order. */
@@ -284,7 +375,10 @@ async function assertRulerCaptured(rows, zoom) {
 
 // ------------------------------------------------------------------ tests
 
-describe(`full page (device scale ${DEVICE_SCALE})`, () => {
+describe(`exact screens (device scale ${DEVICE_SCALE})`, () => {
+  before(() => setExactMs(Infinity));
+  after(() => setExactMs(2500));
+
   test('captures a short page', TIMEOUT, async () => {
     const page = await openPage(`${ORIGIN}/?sections=3`);
     await assertSectionsPageCaptured(page);
@@ -301,6 +395,7 @@ describe(`full page (device scale ${DEVICE_SCALE})`, () => {
     const page = await openPage(`${ORIGIN}/?sections=15`); // about 12,800 CSS px
     const { result } = await assertSectionsPageCaptured(page);
     assert.ok(result.screens > 10);
+    assert.equal(result.filmed, 0);
     await page.close();
   });
 
@@ -355,21 +450,188 @@ describe(`full page (device scale ${DEVICE_SCALE})`, () => {
   });
 });
 
+describe(`filmed screens (device scale ${DEVICE_SCALE})`, () => {
+  // Filmed screens show the same things in the same places, in colors that can
+  // be a step or two off.
+  const CLOSE = 3;
+
+  test('leaves short pages exact', TIMEOUT, async () => {
+    const page = await openPage(`${ORIGIN}/?sections=3`);
+    const { result } = await assertSectionsPageCaptured(page);
+    assert.equal(result.filmed, 0);
+    await page.close();
+  });
+
+  test('films what it cannot wait for on a long page, and does not disturb the page', TIMEOUT, async () => {
+    const page = await openPage(`${ORIGIN}/?sections=15`); // about 12,800 CSS px
+    await page.evaluate(() => {
+      globalThis.resizes = 0;
+      addEventListener('resize', () => globalThis.resizes++);
+    });
+    const { result } = await assertSectionsPageCaptured(page, { tolerance: CLOSE });
+    assert.ok(result.filmed > 5, `${result.filmed} of ${result.screens} screens were filmed. ${videoTrouble.at(-1) ?? ''}`);
+    assert.ok(result.filmed < result.screens - 3, 'screens that did not have to wait are exact');
+    assert.ok(result.totalMs < (result.screens / 2) * 1000 * 0.6, `it took ${Math.round(result.totalMs)} ms`);
+    assert.equal(await page.evaluate(() => globalThis.resizes), 0, 'the page was not resized');
+    await assertNothingLeftBehind(page);
+    await page.close();
+  });
+
+  test('gets every frame it asks for, time after time', TIMEOUT, async () => {
+    // Frames used to go missing on a page that kept still, in most captures.
+    videoTrouble = [];
+    for (let i = 0; i < 5; i++) {
+      const page = await openPage(`${ORIGIN}/?sections=15`);
+      const result = await capture(page);
+      assert.equal(result.ok, true, result.reason);
+      assert.ok(result.filmed > 5, `${result.filmed} of ${result.screens} screens were filmed. ${videoTrouble.at(-1) ?? ''}`);
+      await page.close();
+    }
+    assert.deepEqual(videoTrouble, []);
+  });
+
+  test('does not film windows of an odd size, which would come out scaled', TIMEOUT, async () => {
+    const states = await worker.evaluate(async () => {
+      const wanted = [[1281, 714], [1280, 713]].map(([width, height]) => {
+        const video = new Video({ id: -1 });
+        video.open({ width, height });
+        return video.isWanted;
+      });
+      return wanted;
+    });
+    assert.deepEqual(states, [false, false]);
+  });
+
+  for (const zoom of [1, 1.1, 1.25, 2 / 3]) {
+    test(`joins filmed screens without losing or repeating a row at ${Math.round(zoom * 100)}% zoom`, TIMEOUT, async () => {
+      await setExactMs(0);
+      const bands = 3000;
+      const page = await openPage(`${ORIGIN}/?bars=${bands}`, { zoom });
+      const result = await capture(page);
+      await setExactMs(2500);
+      assert.equal(result.ok, true, result.reason);
+      assert.ok(result.filmed > 3, `${result.filmed} of ${result.screens} screens were filmed. ${videoTrouble.at(-1) ?? ''}`);
+      const read = await readBars(page);
+      assert.deepEqual(read.unreadable, [], 'every row reads as a band, so the mark is nowhere in the image');
+      assert.equal(read.first, 0);
+      assert.ok(read.last === bands - 1 || read.last === bands - 2, `the image ends at the last band (got ${read.last})`);
+      assert.deepEqual(read.jumps, [], 'the bands are in order');
+      assert.ok(read.tallest - read.shortest <= 1, `no seam (bands are ${read.shortest} to ${read.tallest} px tall)`);
+      await page.close();
+    });
+  }
+
+  test('captures every screen exactly when video is not available', TIMEOUT, async () => {
+    await worker.evaluate(() => {
+      globalThis.originalStart = chrome.tabCapture.getMediaStreamId;
+      chrome.tabCapture.getMediaStreamId = async () => { throw new Error('not today'); };
+    });
+    const page = await openPage(`${ORIGIN}/?sections=8`);
+    const { result } = await assertSectionsPageCaptured(page);
+    await worker.evaluate(() => { chrome.tabCapture.getMediaStreamId = globalThis.originalStart; });
+    assert.equal(result.filmed, 0);
+    await assertNothingLeftBehind(page);
+    await page.close();
+  });
+
+  test('goes on exactly when the video stops coming', TIMEOUT, async () => {
+    const page = await openPage(`${ORIGIN}/?sections=8`);
+    await press(page);
+    await waitUntil(() => worker.evaluate(() => chrome.offscreen.hasDocument()));
+    await page.waitForTimeout(900);
+    await worker.evaluate(() => chrome.offscreen.closeDocument());
+    const expected = await measureSectionsPage(page);
+    const result = await outcome();
+    assert.equal(result.ok, true, result.reason);
+    const image = await inspectClipboardImage(page, expected);
+    assert.equal(image.bottomColor, FOOTER_COLOR);
+    assert.ok(Math.abs(image.height / image.scale - expected.cssHeight) <= 1);
+    await assertNothingLeftBehind(page);
+    await page.close();
+  });
+
+  test('stops filming when the capture is canceled', TIMEOUT, async () => {
+    const page = await openPage(`${ORIGIN}/?sections=30`);
+    await press(page);
+    await page.waitForTimeout(1500);
+    await page.keyboard.press('Escape');
+    const result = await outcome();
+    assert.match(result.reason, /Canceled/);
+    await assertNothingLeftBehind(page);
+    await page.close();
+  });
+
+  test('keeps a bar at the bottom whole where the last screen overlaps a filmed one', TIMEOUT, async () => {
+    await setExactMs(0);
+    // Make the page end 20 px into its last screen, so that most of the 50 px
+    // bar is in rows that the screen before has, too.
+    let page = await openPage(`${ORIGIN}/?tricky`);
+    const footer = await page.evaluate(() => {
+      const step = innerHeight - Math.ceil(6 / devicePixelRatio) - 2;
+      const withoutFooter = document.documentElement.scrollHeight - 200;
+      return Math.ceil((withoutFooter + 100) / step) * step + 20 - withoutFooter;
+    });
+    await page.close();
+    // Have every screen filmed but the first and the last. (Retries come right
+    // after one another; those are for the last screen.)
+    await worker.evaluate(() => {
+      globalThis.originalTry = tryCaptureScreen;
+      let calls = 0;
+      let last = 0;
+      globalThis.tryCaptureScreen = async (tab) => {
+        const isRetry = performance.now() - last < 45;
+        last = performance.now();
+        return calls++ === 0 || isRetry ? globalThis.originalTry(tab) : null;
+      };
+    });
+    page = await openPage(`${ORIGIN}/?tricky&footer=${footer}`);
+    const expected = await measureTrickyPage(page);
+    const result = await capture(page);
+    await worker.evaluate(() => { globalThis.tryCaptureScreen = globalThis.originalTry; });
+    await setExactMs(2500);
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(result.filmed, result.screens - 2);
+    const image = await inspectClipboardImage(page, expected);
+    assert.deepEqual(placesOf(image, BAR_COLOR), [{ color: BAR_COLOR, top: expected.cssHeight - 50, height: 50 }]);
+    await page.close();
+  });
+
+  test('shows pinned things once and leaves no trace on a page that fights back', TIMEOUT, async () => {
+    await setExactMs(0);
+    const page = await openPage(`${ORIGIN}/?tricky`, { scrollY: 800 });
+    const before = await trickyState(page);
+    const expected = await measureTrickyPage(page);
+    const result = await capture(page);
+    await setExactMs(2500);
+    assert.equal(result.ok, true, result.reason);
+    assert.ok(result.filmed > 0, 'some of it was filmed');
+    const image = await inspectClipboardImage(page, expected);
+    const near = (color, top, height) => {
+      const places = placesOf(image, color, CLOSE).filter((place) => place.height > 2); // not the blurred edge
+      assert.equal(places.length, 1, `${color} appears once (${JSON.stringify(places)})`);
+      assert.ok(Math.abs(places[0].top - top) <= 2 && Math.abs(places[0].height - height) <= 3,
+        `${color} at ${JSON.stringify(places[0])}, not ${top} (${height})`);
+    };
+    near(HEADER_COLOR, 0, 60);
+    near(STICKY_COLOR, 60, 40);
+    near(BAR_COLOR, expected.cssHeight - 50, 50);
+    near(REVEAL_COLOR, expected.reveal, 300);
+    near(CARD_COLOR, expected.box + 50, 100);
+    await waitUntilStill(page);
+    assert.deepEqual(await trickyState(page), before, 'the page is as it was');
+    await assertNothingLeftBehind(page);
+    await page.close();
+  });
+});
+
 describe('pages that fight back', () => {
+  before(() => setExactMs(Infinity));
+  after(() => setExactMs(2500));
+
   test('shows pinned things once, waits for content to appear, and leaves no trace', TIMEOUT, async () => {
     const page = await openPage(`${ORIGIN}/?tricky`, { scrollY: 800 }); // where the second section snaps
-    const state = () => page.evaluate((toast) => {
-      const copy = document.documentElement.cloneNode(true);
-      copy.querySelectorAll(toast).forEach((element) => element.remove());
-      copy.querySelector('.reveal').classList.remove('seen'); // scrolling past it is what sets this
-      return { html: copy.outerHTML, scrollY: Math.round(window.scrollY) };
-    }, TOAST);
-    const before = await state();
-    const expected = await page.evaluate(() => {
-      const top = (selector) => Math.round(document.querySelector(selector).getBoundingClientRect().top + scrollY);
-      return { cssWidth: document.documentElement.clientWidth, cssHeight: document.documentElement.scrollHeight,
-        reveal: top('.reveal'), box: top('.box'), footer: top('footer') };
-    });
+    const before = await trickyState(page);
+    const expected = await measureTrickyPage(page);
 
     const result = await capture(page);
     assert.equal(result.ok, true, result.reason);
@@ -384,7 +646,7 @@ describe('pages that fight back', () => {
       [{ color: CARD_COLOR, top: expected.box + 50, height: 100 }], 'fixed inside a transformed box');
     assert.ok(Math.abs(image.height / image.scale - expected.cssHeight) <= 1);
     await waitUntilStill(page);
-    assert.deepEqual(await state(), before, 'the page is as it was');
+    assert.deepEqual(await trickyState(page), before, 'the page is as it was');
     await page.close();
   });
 
@@ -484,7 +746,7 @@ describe('telling the user', () => {
 describe('manifest', () => {
   test('does not use the debugger, and asks for nothing more than it needs', TIMEOUT, async () => {
     const { permissions, host_permissions: hosts } = await worker.evaluate(() => chrome.runtime.getManifest());
-    assert.deepEqual(permissions, ['activeTab', 'scripting', 'clipboardWrite', 'contextMenus']);
+    assert.deepEqual(permissions, ['activeTab', 'scripting', 'clipboardWrite', 'contextMenus', 'tabCapture', 'offscreen']);
     assert.equal(hosts, undefined);
   });
 

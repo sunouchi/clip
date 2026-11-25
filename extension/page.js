@@ -10,6 +10,8 @@
  */
 (() => {
   const TOAST_ATTRIBUTE = 'data-clip-toast';
+  const MARK_ATTRIBUTE = 'data-clip-mark';
+  const MARK_CELLS = 10; // a white one, a black one and eight for the number
   const SCROLL_KEYS = new Set([
     ' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End',
   ]);
@@ -69,6 +71,7 @@
   /** Scrolls to a position, waits for the page to look right there, and describes the view. */
   async function scrollTo(y) {
     throwIfCanceled();
+    hideMark();
     jumpTo(y);
     await nextPaint();
     tidyPinnedElements(y === 0);
@@ -87,8 +90,62 @@
       viewportHeight: root.clientHeight,
       pageHeight: root.scrollHeight,
       scale: window.devicePixelRatio,
+      seam: markHeight() + 2,
       atBottom: isAtBottom(),
     };
+  }
+
+  // ------------------------------------------------------------------ mark
+
+  /**
+   * Draws a number, as black and white cells, along the bottom edge of the
+   * window. A video frame that shows it was filmed after everything that came
+   * before, scrolling included. The rows it covers are taken from the next
+   * screen, so it never ends up in the image.
+   *
+   * After the number comes a cell that never stands still. Chrome sends a frame
+   * when something on the page has changed, and now and then misses a change;
+   * on a page that then keeps still, the frame we wait for would never come.
+   */
+  function showMark(mark) {
+    throwIfCanceled();
+    hideMark();
+    const cell = Math.max(8, Math.ceil(16 / window.devicePixelRatio));
+    const left = 32; // clear of the window's rounded corner
+    const height = markHeight();
+    const host = css(document.createElement('div'), {
+      all: 'initial', display: 'flex', position: 'fixed', inset: 'auto', left: `${left}px`, bottom: '0',
+      width: `${cell * (MARK_CELLS + 1)}px`, height: `${height}px`, margin: '0', padding: '0', border: '0',
+      overflow: 'hidden', 'pointer-events': 'none', 'z-index': '2147483647',
+    });
+    host.setAttribute(MARK_ATTRIBUTE, '');
+    host.popover = 'manual';
+    const shadow = host.attachShadow({ mode: 'closed' }); // out of reach of the page's styles
+    const addCell = (color) => {
+      const element = css(document.createElement('div'), { width: `${cell}px`, height: `${height}px`, background: color });
+      shadow.append(element);
+      return element;
+    };
+    for (let i = 0; i < MARK_CELLS; i++) {
+      const light = i === 0 || (i > 1 && (mark >> (MARK_CELLS - 1 - i)) & 1);
+      addCell(light ? '#fff' : '#000');
+    }
+    addCell('#000').animate({ opacity: [0, 1] }, { duration: 500, iterations: Infinity, direction: 'alternate' });
+    document.documentElement.append(host);
+    try {
+      host.showPopover();
+    } catch {
+      // The z-index has to do.
+    }
+    return { left, cell, cells: MARK_CELLS, height };
+  }
+
+  function hideMark() {
+    for (const mark of document.querySelectorAll(`[${MARK_ATTRIBUTE}]`)) mark.remove();
+  }
+
+  function markHeight() {
+    return Math.ceil(6 / window.devicePixelRatio);
   }
 
   function isAtBottom() {
@@ -101,6 +158,7 @@
   }
 
   function restore() {
+    hideMark();
     if (!session) return;
     const { x, y, styles, input } = session;
     session = null;
@@ -365,7 +423,7 @@
 
   // ------------------------------------------------------------- entry point
 
-  const functions = { prepare, scrollTo, restore, clearToast, showToast };
+  const functions = { prepare, scrollTo, showMark, restore, clearToast, showToast };
 
   globalThis.clipPage = {
     /** Chrome swallows exceptions thrown by injected code, so return them instead. */

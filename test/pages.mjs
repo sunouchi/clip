@@ -77,7 +77,7 @@ export const CARD_COLOR = '#1565c0';
  * scrolled to, and a "fixed" card inside a transformed box, which is not
  * really fixed and has to stay in the picture.
  */
-export function trickyPage() {
+export function trickyPage(footerHeight = 200) {
   const sections = Array.from({ length: 5 }, (_, i) =>
     `<section style="background:${SECTION_COLORS[i]}">${i + 1}</section>`).join('\n');
   return `<!doctype html>
@@ -97,7 +97,7 @@ export function trickyPage() {
   .card { position: fixed; top: 50px; left: 0; width: 200px; height: 100px; background: ${CARD_COLOR} }
   .bar { position: fixed; bottom: 0; left: 0; right: 0; height: 50px; z-index: 10; background: ${BAR_COLOR};
          transition: all 3s }
-  footer { height: 200px; background: ${FOOTER_COLOR} }
+  footer { height: ${footerHeight}px; background: ${FOOTER_COLOR} }
 </style></head>
 <body>
 <header></header>
@@ -133,6 +133,32 @@ export function growingPage(steps) {
     block.style.background = '${SECTION_COLORS[2]}';
     document.body.append(block);
   });
+</script>
+</body></html>`;
+}
+
+/**
+ * A ruler in black and white: every band of four CSS pixels carries its number
+ * as bars. Video keeps black and white exact, so this is how we check the
+ * seams between filmed screens. The first two of the twenty bars are always
+ * white and black, and lie where the mark that tells frames apart is drawn.
+ */
+export function barsPage(bands) {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Clip bars (${bands} bands)</title>
+<style>
+  html, body { margin: 0 }
+  canvas { display: block; width: 100%; height: ${bands * 4}px; image-rendering: pixelated }
+</style></head>
+<body><canvas width="20" height="${bands}"></canvas>
+<script>
+  const context = document.querySelector('canvas').getContext('2d');
+  const image = context.createImageData(20, ${bands});
+  for (let band = 0; band < ${bands}; band++) {
+    const bars = [1, 0, ...Array.from({ length: 16 }, (_, i) => (band >> (15 - i)) & 1), 0, 1];
+    bars.forEach((light, i) => image.data.set([light * 255, light * 255, light * 255, 255], (band * 20 + i) * 4));
+  }
+  context.putImageData(image, 0, 0);
 </script>
 </body></html>`;
 }

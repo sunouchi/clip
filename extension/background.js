@@ -1,17 +1,20 @@
 /**
  * Clip: capture the entire page and copy it to the clipboard with one press.
  *
- * The page is scrolled from top to bottom, captured one screen at a time with
- * tabs.captureVisibleTab() and joined into one PNG. Chrome allows two such
- * captures per second, so the work between them is arranged to never be what
- * we are waiting for.
+ * The page is scrolled from top to bottom and joined from screens into one
+ * PNG. Screens come from tabs.captureVisibleTab(), which is exact but limited
+ * to two per second. On long pages, screens that would have to wait for that
+ * limit are filmed through tabCapture instead, and their colors corrected with
+ * what the exact screens show (see yuv.js).
  *
- * Rendering the whole page at once through chrome.debugger is several times
- * faster, and an earlier version did that. But Chrome then shows a "started
- * debugging this browser" bar on every capture, and extensions cannot hide it.
+ * Rendering the whole page at once through chrome.debugger is faster still,
+ * and version 0.1 did that. But Chrome then shows a "started debugging this
+ * browser" bar on every capture, and extensions cannot hide it.
  *
  * Nothing leaves the browser. No network requests, no storage.
  */
+
+importScripts('yuv.js');
 
 const DEFAULT_TITLE = chrome.runtime.getManifest().action.default_title;
 const BADGE_MS = 2500;
@@ -24,11 +27,19 @@ const MAX_IMAGE_AREA = 16384 * 16384;
 const QUOTA_RETRY_MS = 25;
 
 /**
- * Rows, in CSS pixels, left off the bottom of every screen but the last and
- * taken from the next one instead. Keeps seams clean when the viewport ends on
- * a fraction of a pixel, as it does on a zoomed page.
+ * As long as a capture can be done within this time, wait for Chrome's rate
+ * limit and capture screens exactly. That is enough for about six screens. On
+ * longer pages, the screens there is no time to wait for are filmed.
  */
-const SEAM_MARGIN = 2;
+const limits = { exactMs: 2500 };
+
+/** The longest wait for the rate limit, and how long filming a screen takes. */
+const QUOTA_WAIT_MS = 1000;
+const FILM_MS = 120;
+
+/** How long to wait for video to start, and for a frame, before going on without. */
+const VIDEO_START_MS = 2000;
+const VIDEO_FRAME_MS = 1000;
 
 /**
  * Pages can grow while we scroll (lazy images, endless feeds). Follow them up
@@ -88,58 +99,77 @@ async function captureVisibleArea(tab) {
   const { width, height } = bitmap;
   const thumbnail = await makeThumbnail(bitmap, width, height);
   bitmap.close();
-  return { png, thumbnail, width, height, screens: 1, complete: true };
+  return { png, thumbnail, width, height, screens: 1, filmed: 0, complete: true };
 }
 
 /** Scrolls through the page and captures all of it. */
 async function captureFullPage(tab) {
+  const startedAt = performance.now();
+  const fitsInTime = (ms) => performance.now() - startedAt + ms <= limits.exactMs;
   await injectPageScript(tab);
   const page = await callPage(tab, 'prepare');
   try {
     checkImageSize(page.width * page.scale, page.height * page.scale);
     const image = new TallImage();
     const maxHeight = page.height * MAX_GROWTH;
-    let screens = 0;
+    const video = new Video(tab);
     let y = 0;
     let complete = true;
     let drawing = Promise.resolve();
 
-    for (;;) {
-      const view = await callPage(tab, 'scrollTo', y);
-      const screenshot = await captureScreen(tab);
-      screens++;
+    try {
+      for (;;) {
+        const view = await callPage(tab, 'scrollTo', y);
+        const bottom = image.plan(view);
+        if (bottom === null) {
+          complete = false; // the page would not scroll any further
+          break;
+        }
 
-      // Decode and draw while the next screen is being scrolled into place.
-      const bottom = image.plan(view);
-      if (bottom === null) {
-        complete = false; // the page would not scroll any further
-        break;
-      }
-      const previous = drawing;
-      drawing = (async () => {
-        await previous;
-        await image.draw(screenshot, view);
-      })();
-      drawing.catch(() => {}); // reported by the await below
+        // The last screen is always exact: it is drawn in full, so the mark
+        // that tells frames apart would show.
+        const screensLeft = Math.ceil((view.pageHeight - bottom) / (view.viewportHeight - view.seam));
+        let png = await tryCaptureScreen(tab);
+        if (!png && fitsInTime(QUOTA_WAIT_MS + screensLeft * FILM_MS)) png = await captureScreen(tab);
+        let frame = null;
+        if (!view.atBottom && (png ? video.isOpen : video.isWanted)) frame = await video.film(view);
+        if (!png && !frame) png = await captureScreen(tab);
 
-      showProgress(tab, bottom / view.pageHeight);
-      if (view.atBottom) break;
-      if (bottom >= maxHeight) {
-        complete = false; // an endless page
-        break;
+        if (png) {
+          // Decode and draw while the next screen is being scrolled into place.
+          const previous = drawing;
+          drawing = (async () => {
+            await previous;
+            await image.draw(png, view);
+          })();
+          drawing.catch(() => {}); // reported by the await below
+        }
+        if (frame) image.addFrame(frame, view, { exact: Boolean(png) });
+
+        const allExactMs = (screensLeft / 2) * QUOTA_WAIT_MS;
+        if (y === 0 && !fitsInTime(allExactMs)) video.open(await pngSize(png));
+
+        showProgress(tab, bottom / view.pageHeight);
+        if (view.atBottom) break;
+        if (bottom >= maxHeight) {
+          complete = false; // an endless page
+          break;
+        }
+        y = Math.floor(bottom) - 1;
       }
-      y = Math.floor(bottom) - 1;
+    } finally {
+      await video.close();
     }
     await drawing;
 
     // Put the page back before encoding; encoding a long image takes a while.
     await callPage(tab, 'restore');
-    const { canvas, width, height } = image.finish();
+    const { canvas, width, height, screens, filmed } = image.finish();
     const [png, thumbnail] = await Promise.all([
       canvas.convertToBlob({ type: 'image/png' }),
       makeThumbnail(canvas, width, height),
     ]);
-    return { png, thumbnail, width, height, screens, complete };
+    return { png, thumbnail, width, height, screens, filmed, complete };
   } finally {
     await callPage(tab, 'restore').catch(() => {}); // does nothing the second time
   }
@@ -148,19 +178,31 @@ async function captureFullPage(tab) {
 /** Takes one PNG of the visible part of the tab, waiting for Chrome's rate limit if needed. */
 async function captureScreen(tab) {
   for (;;) {
-    await requireActive(tab);
-    let dataUrl;
-    try {
-      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-    } catch (error) {
-      if (!String(error?.message).includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND')) throw error;
-      await new Promise((resolve) => setTimeout(resolve, QUOTA_RETRY_MS));
-      continue;
-    }
-    await requireActive(tab);
-    const bytes = base64ToBytes(dataUrl.slice(dataUrl.indexOf(',') + 1));
-    return new Blob([bytes], { type: 'image/png' });
+    const png = await tryCaptureScreen(tab);
+    if (png) return png;
+    await sleep(QUOTA_RETRY_MS);
   }
+}
+
+/** Takes one PNG of the visible part of the tab, or returns null if Chrome's rate limit is in the way. */
+async function tryCaptureScreen(tab) {
+  await requireActive(tab);
+  let dataUrl;
+  try {
+    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+  } catch (error) {
+    if (String(error?.message).includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND')) return null;
+    throw error;
+  }
+  await requireActive(tab);
+  const bytes = base64ToBytes(dataUrl.slice(dataUrl.indexOf(',') + 1));
+  return new Blob([bytes], { type: 'image/png' });
+}
+
+/** Reads the size of a PNG from its header. */
+async function pngSize(png) {
+  const header = new DataView(await png.slice(0, 24).arrayBuffer());
+  return { width: header.getUint32(16), height: header.getUint32(20) };
 }
 
 /**
@@ -186,6 +228,106 @@ function checkImageSize(width, height) {
 }
 
 /**
+ * Films the tab, for screens that cannot be captured right away.
+ *
+ * Only ever a help: if video cannot be started or a frame does not come, it
+ * closes, and every screen is captured exactly, just more slowly.
+ */
+class Video {
+  #tab;
+  #opening = null;
+  #state = 'unused'; // then 'opening', 'open' and 'closed'
+  #mark = 0;
+
+  constructor(tab) {
+    this.#tab = tab;
+  }
+
+  get isOpen() {
+    return this.#state === 'open';
+  }
+
+  get isWanted() {
+    return this.#state === 'opening' || this.#state === 'open';
+  }
+
+  /** Starts filming at exactly the size of the screens, in the background. */
+  open({ width, height }) {
+    if (width % 2 || height % 2) return; // video comes in even sizes only
+    this.#state = 'opening';
+    this.#opening = within(VIDEO_START_MS, this.#start(width, height)).then(
+      () => { if (this.#state === 'opening') this.#state = 'open'; },
+      (error) => this.#giveUp(error),
+    );
+  }
+
+  async #start(width, height) {
+    await closeOffscreenDocument();
+    await chrome.offscreen.createDocument({
+      url: 'video.html',
+      reasons: ['USER_MEDIA'],
+      justification: 'Film the tab while it is scrolled, to capture long pages quickly.',
+    });
+    const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: this.#tab.id });
+    await this.#send('start', { streamId, width, height });
+    if (this.#state !== 'opening') await closeOffscreenDocument(); // started too late
+  }
+
+  /** Returns a frame of what is on screen now, or null. */
+  async film(view) {
+    // While we wait, nothing moves but the mark. Without it, the first frame
+    // may never come.
+    if (this.#state === 'opening') await callPage(this.#tab, 'showMark', 0);
+    await this.#opening;
+    if (!this.isOpen) return null;
+    this.#mark = (this.#mark % 255) + 1;
+    const mark = this.#mark;
+    const { left, cell, cells, height } = await callPage(this.#tab, 'showMark', mark);
+    const { scale, viewportHeight } = view;
+    const channel = new BroadcastChannel('clip-video');
+    try {
+      const arrival = new Promise((resolve) => {
+        channel.onmessage = ({ data }) => { if (data.mark === mark) resolve(data.frame); };
+      });
+      await this.#send('grab', {
+        mark,
+        left: left * scale,
+        cell: cell * scale,
+        cells,
+        row: Math.round((viewportHeight - height / 2) * scale),
+      });
+      return await within(VIDEO_FRAME_MS, arrival);
+    } catch (error) {
+      this.#giveUp(error);
+      return null;
+    } finally {
+      channel.close();
+    }
+  }
+
+  async close() {
+    if (this.#state === 'unused') return;
+    this.#state = 'closed';
+    await this.#opening;
+    await closeOffscreenDocument();
+  }
+
+  #giveUp(error) {
+    console.warn('[clip] going on without video:', error.message);
+    this.#state = 'closed';
+  }
+
+  async #send(type, message) {
+    const { error } = await chrome.runtime.sendMessage({ target: 'video', type, ...message });
+    if (error) throw new Error(error);
+  }
+}
+
+async function closeOffscreenDocument() {
+  if (await chrome.offscreen.hasDocument()) await chrome.offscreen.closeDocument().catch(() => {});
+}
+
+/**
  * Joins screens, top to bottom, into one image.
  *
  * plan() decides which rows of a screen are new; draw() paints them. They are
@@ -195,6 +337,10 @@ class TallImage {
   #canvas = null;
   #context = null;
   #rows = 0; // image rows spoken for so far
+  #screens = 0;
+  #lastScreen = Infinity; // the first row of the last screen, once there is one
+  #filmed = []; // frames to be developed into the image
+  #samples = []; // frames of screens that were captured exactly, too
 
   /**
    * Returns how far down the page the image reaches with this screen, in CSS
@@ -203,15 +349,22 @@ class TallImage {
   plan(view) {
     const top = Math.round(view.scrollY * view.scale);
     const visible = Math.round(view.viewportHeight * view.scale);
-    const margin = view.atBottom ? 0 : Math.ceil(SEAM_MARGIN * view.scale);
+    const margin = view.atBottom ? 0 : Math.ceil(view.seam * view.scale);
     const end = top + visible - margin;
     if (end <= this.#rows) return null;
     // Draw the last screen in full, over the rows it shares with the one
     // before it: only there are things pinned to the bottom of the window shown.
     const from = view.atBottom ? Math.min(top, this.#rows) : this.#rows;
     view.rows = { top, from: Math.max(from, top), end };
+    if (view.atBottom) this.#lastScreen = view.rows.from;
     this.#rows = end;
+    this.#screens++;
     return end / view.scale;
+  }
+
+  /** Adds a video frame, either of a new screen or of one that was also captured exactly. */
+  addFrame(frame, view, { exact }) {
+    (exact ? this.#samples : this.#filmed).push({ frame, view });
   }
 
   async draw(png, view) {
@@ -225,7 +378,33 @@ class TallImage {
 
   /** Returns the finished image, cut to the rows that were captured. */
   finish() {
-    return this.#resize(this.#rows);
+    const filmed = this.#filmed.length;
+    this.#developFrames();
+    return { ...this.#resize(this.#rows), screens: this.#screens, filmed };
+  }
+
+  /** Paints the filmed screens, last, with everything the exact ones have to tell. */
+  #developFrames() {
+    if (this.#filmed.length === 0) return;
+    const palette = new Palette();
+    const width = this.#canvas.width;
+    for (const { frame, view } of this.#samples) {
+      const { top, from, end } = this.#rowsOf(view);
+      if (end > from) palette.learn(frame, this.#context.getImageData(0, from, width, end - from), from - top);
+    }
+    for (const { frame, view } of this.#filmed) {
+      const { top, from, end } = this.#rowsOf(view);
+      if (end <= from) continue;
+      this.#fit(width, end, Math.round(view.pageHeight * view.scale));
+      this.#context.putImageData(palette.develop(frame, from - top, end - top, width), 0, from);
+    }
+    this.#samples = [];
+    this.#filmed = [];
+  }
+
+  /** The rows of a screen, short of those the last screen was drawn over. */
+  #rowsOf({ rows: { top, from, end } }) {
+    return { top, from, end: Math.min(end, this.#lastScreen) };
   }
 
   /** Makes sure the canvas reaches down to `end`, with room for the rest of the page if possible. */
@@ -332,7 +511,20 @@ async function report(tab, outcome) {
   }, BADGE_MS);
 }
 
-// ------------------------------------------------------------------- base64
+// ------------------------------------------------------------------- helpers
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Settles like the promise, or rejects if that takes too long. */
+function within(ms, promise) {
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 function base64ToBytes(base64) {
   if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(base64);
