@@ -1,324 +1,338 @@
 /**
- * Clip: capture the entire page in one shot and copy it to the clipboard.
+ * Clip: capture the entire page and copy it to the clipboard with one press.
  *
- * Scroll-and-stitch extensions are slow because Chrome limits
- * tabs.captureVisibleTab() to two calls per second. Clip avoids that limit:
- * it attaches the DevTools protocol to the tab and asks Chrome to render the
- * whole page at once (Page.captureScreenshot with captureBeyondViewport), then
- * writes the PNG to the clipboard from inside the page.
+ * The page is scrolled from top to bottom, captured one screen at a time with
+ * tabs.captureVisibleTab() and joined into one PNG. Chrome allows two such
+ * captures per second, so the work between them is arranged to never be what
+ * we are waiting for.
+ *
+ * Rendering the whole page at once through chrome.debugger is several times
+ * faster, and an earlier version did that. But Chrome then shows a "started
+ * debugging this browser" bar on every capture, and extensions cannot hide it.
  *
  * Nothing leaves the browser. No network requests, no storage.
  */
 
-const PROTOCOL_VERSION = '1.3';
-const BADGE_MS = 1500;
 const DEFAULT_TITLE = chrome.runtime.getManifest().action.default_title;
+const BADGE_MS = 2500;
+
+/** Limits of a canvas in Chrome, and so of a joined image. */
+const MAX_IMAGE_SIDE = 65535;
+const MAX_IMAGE_AREA = 16384 * 16384;
+
+/** How soon to try again when Chrome says we are capturing too fast. */
+const QUOTA_RETRY_MS = 25;
 
 /**
- * Chrome cannot render more than this many device pixels in one go. Past it,
- * the capture silently repeats the top of the page. Taller pages are captured
- * as several tiles and stitched together.
+ * Rows, in CSS pixels, left off the bottom of every screen but the last and
+ * taken from the next one instead. Keeps seams clean when the viewport ends on
+ * a fraction of a pixel, as it does on a zoomed page.
  */
-const MAX_TILE_DEVICE_PX = 16384;
-
-/** A canvas cannot be taller than this, so neither can a stitched image. */
-const MAX_IMAGE_DEVICE_PX = 65535;
+const SEAM_MARGIN = 2;
 
 /**
- * Tile heights are multiples of this, so that a tile is a whole number of
- * device pixels on displays scaled in steps of 25% (1.25, 1.5, 1.75 ...).
+ * Pages can grow while we scroll (lazy images, endless feeds). Follow them up
+ * to this many times the height they had at the start, then stop.
  */
-const TILE_STEP = 4;
+const MAX_GROWTH = 1.5;
 
-/** Tabs with a capture in progress, so a double press does not attach twice. */
-const busyTabs = new Set();
+/** Captures share one rate limit, so run one at a time. */
+let busy = false;
 
-chrome.action.onClicked.addListener(async (tab) => {
-  if (tab.id === undefined || busyTabs.has(tab.id)) return;
-  busyTabs.add(tab.id);
+chrome.action.onClicked.addListener((tab) => run(tab, 'full'));
+
+chrome.commands.onCommand.addListener((command, tab) => {
+  if (command === 'capture-visible') run(tab, 'visible');
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({ id: 'full', title: 'Capture the full page', contexts: ['action'] });
+    chrome.contextMenus.create({ id: 'visible', title: 'Capture the visible area', contexts: ['action'] });
+  });
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => run(tab, info.menuItemId));
+
+/** Captures the tab, puts the image on the clipboard and tells the user how it went. */
+async function run(tab, mode) {
+  if (tab?.id === undefined || busy) return;
+  busy = true;
+  const startedAt = performance.now();
   try {
-    const shot = await captureFullPageToClipboard(tab);
-    const summary = `${shot.imageWidth} × ${shot.imageHeight} px in ${Math.round(shot.totalMs)} ms`;
-    console.info(`[clip] copied ${summary}`, shot);
-    await showResult(tab.id, true, `Clip: copied ${summary}`);
+    const shot = mode === 'visible' ? await captureVisibleArea(tab) : await captureFullPage(tab);
+    const capturedAt = performance.now();
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': shot.png })]);
+    const totalMs = performance.now() - startedAt;
+    const stats = { mode, ...shot, png: undefined, thumbnail: undefined, copyMs: totalMs - (capturedAt - startedAt), totalMs };
+    console.info(`[clip] copied ${shot.width} × ${shot.height} px in ${Math.round(totalMs)} ms`, stats);
+    await report(tab, { ok: true, ...stats, thumbnail: shot.thumbnail });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     console.warn('[clip] capture failed:', reason);
-    await showResult(tab.id, false, `Clip: could not capture this page. ${reason}`);
+    await report(tab, { ok: false, mode, reason });
   } finally {
-    busyTabs.delete(tab.id);
+    busy = false;
   }
-});
+}
 
-/**
- * Captures the whole page of the given tab and puts it on the clipboard.
- * Returns the size of the page and of the image, and how long each step took.
- */
-async function captureFullPageToClipboard(tab) {
-  const target = { tabId: tab.id };
-  const send = (method, params) => chrome.debugger.sendCommand(target, method, params);
-  const startedAt = performance.now();
+// --------------------------------------------------------------- capturing
 
-  await chrome.debugger.attach(target, PROTOCOL_VERSION);
+/** Captures what is visible in the tab right now. */
+async function captureVisibleArea(tab) {
+  // Chrome's own pages can be captured like this but not scripted, so there
+  // is no earlier toast to clear on them.
+  await injectPageScript(tab).then(() => callPage(tab, 'clearToast')).catch(() => {});
+  const png = await captureScreen(tab);
+  const bitmap = await createImageBitmap(png);
+  const { width, height } = bitmap;
+  const thumbnail = await makeThumbnail(bitmap, width, height);
+  bitmap.close();
+  return { png, thumbnail, width, height, screens: 1, complete: true };
+}
+
+/** Scrolls through the page and captures all of it. */
+async function captureFullPage(tab) {
+  await injectPageScript(tab);
+  const page = await callPage(tab, 'prepare');
   try {
-    await waitForViewportToSettle(send);
-    await pinViewport(send, tab);
-    const evaluate = await createIsolatedWorld(send);
-    const readyAt = performance.now();
+    checkImageSize(page.width * page.scale, page.height * page.scale);
+    const image = new TallImage();
+    const maxHeight = page.height * MAX_GROWTH;
+    let screens = 0;
+    let y = 0;
+    let complete = true;
+    let drawing = Promise.resolve();
 
-    const restoreScroll = await scrollToTop(evaluate);
-    let page;
-    let tiles;
-    try {
-      page = await measurePage(send, evaluate, tab);
-      tiles = await captureTiles(send, page);
-    } finally {
-      await restoreScroll();
+    for (;;) {
+      const view = await callPage(tab, 'scrollTo', y);
+      const screenshot = await captureScreen(tab);
+      screens++;
+
+      // Decode and draw while the next screen is being scrolled into place.
+      const bottom = image.plan(view);
+      if (bottom === null) {
+        complete = false; // the page would not scroll any further
+        break;
+      }
+      const previous = drawing;
+      drawing = (async () => {
+        await previous;
+        await image.draw(screenshot, view);
+      })();
+      drawing.catch(() => {}); // reported by the await below
+
+      showProgress(tab, bottom / view.pageHeight);
+      if (view.atBottom) break;
+      if (bottom >= maxHeight) {
+        complete = false; // an endless page
+        break;
+      }
+      y = Math.floor(bottom) - 1;
     }
-    const capturedAt = performance.now();
+    await drawing;
 
-    const png = tiles.length === 1 ? tiles[0] : await stitchTiles(tiles);
-    const stitchedAt = performance.now();
-
-    await writePngToClipboard(send, evaluate.contextId, png);
-    const copiedAt = performance.now();
-
-    return {
-      cssWidth: page.cssWidth,
-      cssHeight: page.cssHeight,
-      imageWidth: page.imageWidth,
-      imageHeight: page.imageHeight,
-      tiles: tiles.length,
-      settleMs: readyAt - startedAt,
-      captureMs: capturedAt - readyAt,
-      stitchMs: stitchedAt - capturedAt,
-      copyMs: copiedAt - stitchedAt,
-      totalMs: copiedAt - startedAt,
-    };
+    // Put the page back before encoding; encoding a long image takes a while.
+    await callPage(tab, 'restore');
+    const { canvas, width, height } = image.finish();
+    const [png, thumbnail] = await Promise.all([
+      canvas.convertToBlob({ type: 'image/png' }),
+      makeThumbnail(canvas, width, height),
+    ]);
+    return { png, thumbnail, width, height, screens, complete };
   } finally {
-    // Detaching also drops the viewport and focus emulation set above.
-    await chrome.debugger.detach(target).catch(() => {});
+    await callPage(tab, 'restore').catch(() => {}); // does nothing the second time
   }
 }
 
-/**
- * Waits for the viewport to stop resizing after the debugger attaches.
- *
- * Attaching makes Chrome slide in its "started debugging this browser" bar,
- * which shrinks the viewport over roughly 150 ms. A capture taken while the
- * viewport is still moving comes out corrupted: the first screen is repeated
- * all the way down the image. So poll the viewport height and continue once
- * it has been still for a moment.
- *
- * When the bar is already showing (a capture a few seconds ago, or DevTools
- * attached by something else) nothing moves, and we stop waiting quickly.
- */
-async function waitForViewportToSettle(send) {
-  const POLL_MS = 8;
-  const START_TIMEOUT_MS = 100; // how long to wait for the bar to start moving
-  const STILL_MS = 40; // how long the height must stay unchanged
-  const GIVE_UP_MS = 800;
-
-  const viewportHeight = async () =>
-    (await send('Page.getLayoutMetrics')).cssLayoutViewport.clientHeight;
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  const startedAt = performance.now();
-  let lastHeight = await viewportHeight();
-  let lastChangeAt = startedAt;
-  let moved = false;
-
+/** Takes one PNG of the visible part of the tab, waiting for Chrome's rate limit if needed. */
+async function captureScreen(tab) {
   for (;;) {
-    await sleep(POLL_MS);
-    const now = performance.now();
-    const height = await viewportHeight();
-    if (height !== lastHeight) {
-      moved = true;
-      lastHeight = height;
-      lastChangeAt = now;
+    await requireActive(tab);
+    let dataUrl;
+    try {
+      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    } catch (error) {
+      if (!String(error?.message).includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND')) throw error;
+      await new Promise((resolve) => setTimeout(resolve, QUOTA_RETRY_MS));
+      continue;
     }
-    if (moved && now - lastChangeAt >= STILL_MS) return;
-    if (!moved && now - startedAt >= START_TIMEOUT_MS) return;
-    if (now - startedAt >= GIVE_UP_MS) return;
+    await requireActive(tab);
+    const bytes = base64ToBytes(dataUrl.slice(dataUrl.indexOf(',') + 1));
+    return new Blob([bytes], { type: 'image/png' });
   }
 }
 
 /**
- * Pins the viewport to the size it had before the debugging bar appeared.
- *
- * The bar makes the viewport shorter, which changes the layout of anything
- * sized in viewport units (a 100vh hero, for example). Pinning the size the
- * tab had when the user pressed the button makes the capture match what they
- * were looking at. tab.width and tab.height are already in CSS pixels, so
- * they need no correction for page zoom.
+ * captureVisibleTab() captures whichever tab is in front. Make sure that is
+ * still the one we were asked to capture.
  */
-async function pinViewport(send, tab) {
-  if (!tab.width || !tab.height) return;
-  await send('Emulation.setDeviceMetricsOverride', {
-    width: tab.width,
-    height: tab.height,
-    deviceScaleFactor: 0, // keep the real device pixel ratio
-    mobile: false,
-  });
+async function requireActive(tab) {
+  const now = await chrome.tabs.get(tab.id).catch(() => null);
+  if (!now) throw new Error('The tab was closed.');
+  if (!now.active || now.windowId !== tab.windowId) throw new Error('You switched to another tab.');
 }
 
-/**
- * Creates an isolated world in the page and returns a function that evaluates
- * an expression there. The page's own scripts cannot see or interfere with it.
- */
-async function createIsolatedWorld(send) {
-  const { frameTree } = await send('Page.getFrameTree');
-  const { executionContextId } = await send('Page.createIsolatedWorld', {
-    frameId: frameTree.frame.id,
-    worldName: 'clip',
-  });
-  const evaluate = async (expression) => {
-    const { result, exceptionDetails } = await send('Runtime.evaluate', {
-      expression,
-      contextId: executionContextId,
-      returnByValue: true,
-      awaitPromise: true,
-    });
-    if (exceptionDetails) throw new Error(describeException(exceptionDetails));
-    return result.value;
-  };
-  evaluate.contextId = executionContextId;
-  return evaluate;
+/** How tall an image of this width can be. */
+function maxImageHeight(width) {
+  return Math.min(MAX_IMAGE_SIDE, Math.floor(MAX_IMAGE_AREA / width));
 }
 
-/**
- * Scrolls the page to the top and returns a function that scrolls back.
- *
- * Fixed and sticky elements are painted where the viewport currently is, so a
- * capture taken halfway down the page would show the site header in the
- * middle of the image. Capturing from the top puts it where readers expect.
- */
-async function scrollToTop(evaluate) {
-  const [x, y] = await evaluate('[window.scrollX, window.scrollY]');
-  if (x === 0 && y === 0) return async () => {};
-
-  // Wait two frames so scroll-driven headers have repainted, but never hang.
-  await evaluate(`new Promise((done) => {
-    window.scrollTo({ left: 0, top: 0, behavior: 'instant' });
-    requestAnimationFrame(() => requestAnimationFrame(() => done(true)));
-    setTimeout(() => done(true), 150);
-  })`);
-  return async () => {
-    await evaluate(`window.scrollTo({ left: ${x}, top: ${y}, behavior: 'instant' })`).catch(() => {});
-  };
-}
-
-/**
- * Measures the whole page.
- *
- * Page.captureScreenshot takes its clip in device-independent pixels, which
- * are CSS pixels multiplied by the page zoom. Passing CSS pixels on a page
- * zoomed to 125% would capture only the top-left 80% of it.
- *
- * The image is sized in whole device pixels, rounded down: when the page ends
- * on a fraction of a pixel (common when zoomed), rounding up would add a
- * one-pixel line of background along the bottom or right edge.
- */
-async function measurePage(send, evaluate, tab) {
-  const [{ cssContentSize }, devicePixelRatio, zoom] = await Promise.all([
-    send('Page.getLayoutMetrics'),
-    evaluate('window.devicePixelRatio'),
-    chrome.tabs.getZoom(tab.id).catch(() => 1),
-  ]);
-  // Round away float noise first (a zoom of 0.8 arrives as 0.800000011920929).
-  const toDevicePx = (css) => Math.floor(Math.round(css * devicePixelRatio * 100) / 100);
-  const deviceScale = Math.round((devicePixelRatio / zoom) * 1000) / 1000;
-
-  const imageWidth = toDevicePx(cssContentSize.width);
-  const imageHeight = toDevicePx(cssContentSize.height);
-  if (imageHeight > MAX_IMAGE_DEVICE_PX) {
-    const pixels = imageHeight.toLocaleString('en-US');
+function checkImageSize(width, height) {
+  if (height > maxImageHeight(width)) {
+    const pixels = Math.round(height).toLocaleString('en-US');
     throw new Error(`The page is too long to fit in one image (${pixels} px tall).`);
   }
-  return {
-    cssWidth: Math.ceil(cssContentSize.width),
-    cssHeight: Math.ceil(cssContentSize.height),
-    width: imageWidth / deviceScale, // device-independent pixels
-    height: imageHeight / deviceScale,
-    deviceScale,
-    imageWidth,
-    imageHeight,
-  };
 }
 
-/** Captures the page top to bottom as one or more base64 PNG tiles. */
-async function captureTiles(send, page) {
-  const tileHeight = Math.max(
-    TILE_STEP,
-    Math.floor(MAX_TILE_DEVICE_PX / page.deviceScale / TILE_STEP) * TILE_STEP,
-  );
-  const tiles = [];
-  for (let y = 0; y < page.height; y += tileHeight) {
-    const { data } = await send('Page.captureScreenshot', {
-      format: 'png',
-      captureBeyondViewport: true,
-      optimizeForSpeed: true,
-      clip: { x: 0, y, width: page.width, height: Math.min(tileHeight, page.height - y), scale: 1 },
-    });
-    tiles.push(data);
+/**
+ * Joins screens, top to bottom, into one image.
+ *
+ * plan() decides which rows of a screen are new; draw() paints them. They are
+ * separate so that scrolling can go on while screens are still being decoded.
+ */
+class TallImage {
+  #canvas = null;
+  #context = null;
+  #rows = 0; // image rows spoken for so far
+
+  /**
+   * Returns how far down the page the image reaches with this screen, in CSS
+   * pixels, or null if the screen shows nothing new.
+   */
+  plan(view) {
+    const top = Math.round(view.scrollY * view.scale);
+    const visible = Math.round(view.viewportHeight * view.scale);
+    const margin = view.atBottom ? 0 : Math.ceil(SEAM_MARGIN * view.scale);
+    const end = top + visible - margin;
+    if (end <= this.#rows) return null;
+    // Draw the last screen in full, over the rows it shares with the one
+    // before it: only there are things pinned to the bottom of the window shown.
+    const from = view.atBottom ? Math.min(top, this.#rows) : this.#rows;
+    view.rows = { top, from: Math.max(from, top), end };
+    this.#rows = end;
+    return end / view.scale;
   }
-  return tiles;
-}
 
-/** Joins base64 PNG tiles top to bottom and returns one base64 PNG. */
-async function stitchTiles(tiles) {
-  const bitmaps = await Promise.all(
-    tiles.map((tile) => createImageBitmap(new Blob([base64ToBytes(tile)], { type: 'image/png' }))),
-  );
-  const width = bitmaps[0].width;
-  const height = bitmaps.reduce((sum, bitmap) => sum + bitmap.height, 0);
-  const canvas = new OffscreenCanvas(width, height);
-  const context = canvas.getContext('2d');
-  let y = 0;
-  for (const bitmap of bitmaps) {
-    context.drawImage(bitmap, 0, y);
-    y += bitmap.height;
+  async draw(png, view) {
+    const bitmap = await createImageBitmap(png);
+    const { top, from, end } = view.rows;
+    const width = Math.min(bitmap.width, Math.round(view.viewportWidth * view.scale));
+    this.#fit(width, end, Math.round(view.pageHeight * view.scale));
+    this.#context.drawImage(bitmap, 0, from - top, width, end - from, 0, from, width, end - from);
     bitmap.close();
   }
+
+  /** Returns the finished image, cut to the rows that were captured. */
+  finish() {
+    return this.#resize(this.#rows);
+  }
+
+  /** Makes sure the canvas reaches down to `end`, with room for the rest of the page if possible. */
+  #fit(width, end, pageEnd) {
+    checkImageSize(width, end);
+    const height = Math.min(maxImageHeight(width), Math.max(end, pageEnd));
+    if (!this.#canvas) {
+      this.#canvas = new OffscreenCanvas(width, height);
+      this.#context = this.#canvas.getContext('2d', { alpha: false });
+    } else if (end > this.#canvas.height) {
+      this.#resize(height);
+    }
+  }
+
+  #resize(height) {
+    if (height !== this.#canvas.height) {
+      const resized = new OffscreenCanvas(this.#canvas.width, height);
+      const context = resized.getContext('2d', { alpha: false });
+      context.drawImage(this.#canvas, 0, 0);
+      this.#canvas = resized;
+      this.#context = context;
+    }
+    return { canvas: this.#canvas, width: this.#canvas.width, height: this.#canvas.height };
+  }
+}
+
+/** A small picture of the image for the toast, as base64 PNG. Tall images are cut at the bottom. */
+async function makeThumbnail(source, width, height) {
+  const WIDTH = 128;
+  const HEIGHT = 160;
+  // Show the whole page if that leaves it wide enough to recognize.
+  const scale = Math.max(Math.min(WIDTH / width, HEIGHT / height), 56 / width);
+  const w = Math.max(1, Math.round(width * scale));
+  const h = Math.max(1, Math.min(HEIGHT, Math.round(height * scale)));
+  const canvas = new OffscreenCanvas(w, h);
+  const context = canvas.getContext('2d');
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(source, 0, 0, width, h / scale, 0, 0, w, h);
   const blob = await canvas.convertToBlob({ type: 'image/png' });
   return bytesToBase64(new Uint8Array(await blob.arrayBuffer()));
 }
 
-/**
- * Writes a base64 PNG to the clipboard from inside the page.
- *
- * A service worker has no clipboard, so the write has to happen in a document.
- * Focus is emulated because the Clipboard API rejects writes from an
- * unfocused document, for example when the address bar has focus.
- */
-async function writePngToClipboard(send, contextId, base64) {
-  await send('Emulation.setFocusEmulationEnabled', { enabled: true });
-  const { exceptionDetails } = await send('Runtime.callFunctionOn', {
-    executionContextId: contextId,
-    functionDeclaration: copyPngInPage.toString(),
-    arguments: [{ value: base64 }],
-    awaitPromise: true,
-    userGesture: true,
-  });
-  if (exceptionDetails) throw new Error(describeException(exceptionDetails));
+// ------------------------------------------------------- talking to the page
+
+async function injectPageScript(tab) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['page.js'] });
+  } catch {
+    throw new Error('Chrome does not let extensions scroll this page. Try capturing the visible area.');
+  }
 }
 
-/** Runs inside the page. Must be self-contained: it is sent over as source text. */
-async function copyPngInPage(base64) {
-  if (!navigator.clipboard || typeof ClipboardItem === 'undefined') {
-    throw new Error('The clipboard is not available on this page (it is not served over HTTPS).');
-  }
-  let bytes;
-  if (typeof Uint8Array.fromBase64 === 'function') {
-    bytes = Uint8Array.fromBase64(base64);
-  } else {
-    const binary = atob(base64);
-    bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  }
-  const blob = new Blob([bytes], { type: 'image/png' });
-  await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+/** Calls a function that page.js defined in the page's isolated world. */
+async function callPage(tab, name, ...args) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (name, args) => globalThis.clipPage.call(name, args),
+    args: [name, args],
+  });
+  // Chrome swallows exceptions thrown by injected code, so page.js returns them.
+  if (!result) throw new Error('The page went away.');
+  if (result.error) throw new Error(result.error);
+  return result.value;
 }
+
+// --------------------------------------------------------- telling the user
+
+function showProgress(tab, fraction) {
+  const percent = Math.min(99, Math.round(fraction * 100));
+  chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: '#57606a' }).catch(() => {});
+  chrome.action.setBadgeTextColor({ tabId: tab.id, color: '#ffffff' }).catch(() => {});
+  chrome.action.setBadgeText({ tabId: tab.id, text: `${percent}%` }).catch(() => {});
+}
+
+/** Says how the capture went: a toast in the page, and a badge and tooltip on the button. */
+async function report(tab, outcome) {
+  const tabId = tab.id;
+  const size = `${outcome.width} × ${outcome.height} px`;
+  const what = outcome.mode === 'visible' ? 'Visible area' : 'Full page';
+  const toast = outcome.ok
+    ? {
+        ok: true,
+        title: outcome.complete ? 'Copied to the clipboard' : 'Copied, but not the whole page',
+        detail: outcome.complete ? `${what}, ${size}` : `The rest could not be scrolled to. ${size}`,
+        thumbnail: outcome.thumbnail,
+      }
+    : { ok: false, title: 'Could not capture this page', detail: outcome.reason };
+
+  // No toast on pages that cannot be scripted. The badge is all there is.
+  const toasted = callPage(tab, 'showToast', toast).catch(() => {});
+  try {
+    await chrome.action.setBadgeBackgroundColor({ tabId, color: outcome.ok ? '#1a7f37' : '#cf222e' });
+    await chrome.action.setBadgeTextColor({ tabId, color: '#ffffff' });
+    await chrome.action.setBadgeText({ tabId, text: outcome.ok ? '✓' : '!' });
+    await chrome.action.setTitle({ tabId, title: `Clip: ${toast.title}. ${toast.detail}` });
+  } catch {
+    return; // The tab was closed while we were capturing.
+  }
+  await toasted;
+  setTimeout(() => {
+    if (busy) return; // another capture is using the badge
+    chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {});
+    if (outcome.ok) chrome.action.setTitle({ tabId, title: DEFAULT_TITLE }).catch(() => {});
+  }, BADGE_MS);
+}
+
+// ------------------------------------------------------------------- base64
 
 function base64ToBytes(base64) {
   if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(base64);
@@ -330,31 +344,9 @@ function base64ToBytes(base64) {
 
 function bytesToBase64(bytes) {
   if (typeof bytes.toBase64 === 'function') return bytes.toBase64();
-  const CHUNK = 0x8000;
   let binary = '';
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
   }
   return btoa(binary);
-}
-
-function describeException(details) {
-  const description = details.exception?.description ?? details.text ?? 'Unknown error';
-  return description.replace(/^Error: /, '').split('\n')[0];
-}
-
-/** Flashes a badge on the toolbar icon and puts the outcome in its tooltip. */
-async function showResult(tabId, ok, title) {
-  try {
-    await chrome.action.setBadgeBackgroundColor({ tabId, color: ok ? '#1a7f37' : '#cf222e' });
-    await chrome.action.setBadgeTextColor({ tabId, color: '#ffffff' });
-    await chrome.action.setBadgeText({ tabId, text: ok ? '✓' : '!' });
-    await chrome.action.setTitle({ tabId, title });
-  } catch {
-    return; // The tab was closed while we were capturing.
-  }
-  setTimeout(() => {
-    chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {});
-    if (ok) chrome.action.setTitle({ tabId, title: DEFAULT_TITLE }).catch(() => {});
-  }, BADGE_MS);
 }
