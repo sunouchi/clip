@@ -1,8 +1,8 @@
 {
   "name": "clip",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Chrome extension that captures the entire page in one shot and copies it to the clipboard.",
+  "description": "Chrome extension that captures the entire page and copies it to the clipboard with one press.",
   "license": "MIT",
   "type": "module",
   "scripts": {
